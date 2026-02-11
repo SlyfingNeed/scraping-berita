@@ -4,6 +4,12 @@ import argparse
 from datetime import datetime
 from typing import List, Dict
 
+# Fix Windows console encoding for Unicode characters
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 import config
 from rss_collector import RSSCollector
 from article_scraper import ArticleScraper
@@ -14,7 +20,8 @@ from utils import (
     random_delay, 
     print_header, 
     print_article_info,
-    get_timestamp
+    get_timestamp,
+    is_article_in_date_range
 )
 
 
@@ -52,61 +59,113 @@ class NewsScraperOrchestrator:
             print("\n No articles collected from RSS feeds")
             return
         
-        # Step 2: Filter out already scraped URLs
-        print_header("FILTERING NEW ARTICLES")
-        new_articles = []
+        # Step 2: Filter by date range
+        print_header("FILTERING BY DATE & DEDUPLICATION")
+        
+        date_filtered = []
+        outside_date_range = 0
         
         for article in rss_articles:
+            # Check date range
+            if is_article_in_date_range(
+                article.get('published_date', ''),
+                config.DATE_FILTER_START_YEAR,
+                config.DATE_FILTER_END_YEAR
+            ):
+                date_filtered.append(article)
+            else:
+                outside_date_range += 1
+        
+        # Filter out already scraped URLs
+        new_articles = []
+        for article in date_filtered:
             if not self.url_tracker.is_scraped(article['url']):
                 new_articles.append(article)
             else:
                 self.stats['already_scraped'] += 1
         
+        if config.DATE_FILTER_START_YEAR or config.DATE_FILTER_END_YEAR:
+            date_range = f"{config.DATE_FILTER_START_YEAR or '...'}-{config.DATE_FILTER_END_YEAR or '...'}"
+            print(f"  Date range: {date_range}")
+            print(f"  Within date range: {len(date_filtered)}")
+            print(f"  Outside date range: {outside_date_range}")
         print(f"  New articles to process: {len(new_articles)}")
         print(f"  Already scraped: {self.stats['already_scraped']}")
         
         if not new_articles:
-            print("\nNo new articles to scrape")
+            print("\n  No new articles to scrape")
             return
         
-        # Step 3: Scrape and filter articles
-        print_header("SCRAPING & FILTERING ARTICLES")
-        matched_articles = []
-        
-        for i, article in enumerate(new_articles, 1):
-            print(f"\n[{i}/{len(new_articles)}] Processing: {article['title'][:60]}...")
+        # Step 3: Pre-filter by title/description to avoid scraping irrelevant articles
+        print_header("PRE-FILTERING BY TITLE & DESCRIPTION")
+        candidates = []
+        skipped_no_potential = 0
+        short_description_count = 0
+
+        for article in new_articles:
+            title_text = article.get('title', '')
+            desc_text = article.get('description', '')
             
-            # Quick check: Does title match keywords?
-            title_match = self.keyword_filter.find_matching_keyword(article['title'], "")
-            
-            if title_match:
-                print(f"  ✓ Title matched keyword: {title_match}")
-            
-            # Scrape full article content
-            print(f"  Scraping content...")
-            content = self.article_scraper.scrape_article(article['url'])
-            
-            self.stats['articles_scraped'] += 1
-            
-            if not content:
-                print(f"  Could not extract content")
-                # Mark as scraped even if failed to avoid retrying
-                self.url_tracker.add_url(article['url'])
+            # If RSS description is too short or missing, we can't reliably pre-filter
+            # Include it as a candidate to check full content
+            desc_length = len(desc_text.strip())
+            if desc_length < config.PRE_FILTER_MIN_DESCRIPTION_LENGTH:
+                candidates.append(article)
+                short_description_count += 1
                 continue
             
-            print(f" Extracted {len(content)} characters")
-            
-            # Check if content matches keywords
-            matched_keyword = self.keyword_filter.check_article(
-                article['title'], 
-                content,
-                return_all=True  # Get all matching keywords
+            # Check if title or RSS description contains any keyword
+            pre_match = self.keyword_filter.check_article(
+                title_text, desc_text, return_all=False
             )
-            
+            if pre_match:
+                candidates.append(article)
+            else:
+                # DON'T mark as scraped — title pre-filter is cheap,
+                # and we want these re-evaluated if keywords change.
+                skipped_no_potential += 1
+
+        print(f"  Candidates with keyword in title/desc: {len(candidates) - short_description_count}")
+        print(f"  Candidates (short/no description):     {short_description_count}")
+        print(f"  Skipped (no keyword potential):         {skipped_no_potential}")
+        print(f"  Total candidates to scrape:             {len(candidates)}")
+
+        if not candidates:
+            print("\n  ⚠ No articles matched keywords in title/description")
+            print("  Tip: Your keywords may be too specific for RSS descriptions.")
+            print("       Consider broadening keywords or lowering the pre-filter threshold.")
+            self.print_summary()
+            return
+
+        # Step 4: Scrape full content for candidates only
+        print_header("SCRAPING MATCHED CANDIDATES")
+        matched_articles = []
+
+        for i, article in enumerate(candidates, 1):
+            print(f"\n[{i}/{len(candidates)}] {article['title'][:65]}")
+            print(f"  Source: {article['source']}")
+
+            # Scrape full article content
+            content = self.article_scraper.scrape_article(article['url'])
+            self.stats['articles_scraped'] += 1
+
+            if not content:
+                print(f"  ✗ Could not extract content")
+                self.url_tracker.add_url(article['url'])
+                continue
+
+            print(f"  ✓ Extracted {len(content)} characters")
+
+            # Verify keyword match in full content (title + content)
+            matched_keyword = self.keyword_filter.check_article(
+                article['title'],
+                content,
+                return_all=True
+            )
+
             if matched_keyword:
-                # Article matches! Save it
                 self.stats['articles_matched'] += 1
-                
+
                 article_data = {
                     'title': article['title'],
                     'content': content,
@@ -117,17 +176,15 @@ class NewsScraperOrchestrator:
                     'url': article['url'],
                     'scraped_at': get_timestamp()
                 }
-                
+
                 matched_articles.append(article_data)
                 print_article_info(article_data)
-                
-                # Mark URL as scraped
-                self.url_tracker.add_url(article['url'])
             else:
-                print(f" No keyword match")
-                # Mark as scraped
-                self.url_tracker.add_url(article['url'])
-            
+                print(f"  ✗ No keyword match in full content")
+
+            # Mark URL as scraped
+            self.url_tracker.add_url(article['url'])
+
             # Add delay between articles
             random_delay()
         

@@ -11,6 +11,10 @@ class ArticleScraper:
     
     def __init__(self):
         self.session = requests.Session()
+        self.session.headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+        })
     
     def scrape_article(self, url: str, retries: int = 0) -> Optional[str]:
 
@@ -18,23 +22,21 @@ class ArticleScraper:
             return None
         
         try:
-            # Set headers with random user agent
-            headers = {
-                'User-Agent': get_random_user_agent(),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-            }
+            # Rotate user agent per request
+            self.session.headers['User-Agent'] = get_random_user_agent()
             
-            # Fetch page
+            # Fetch page (allow_redirects handles Google News URLs automatically)
             response = self.session.get(
                 url, 
-                headers=headers, 
                 timeout=config.REQUEST_TIMEOUT,
                 allow_redirects=True
             )
             response.raise_for_status()
+
+            # Use the final redirected URL for trafilatura
+            final_url = response.url
             
-            content = self._extract_with_trafilatura(response.text, url)
+            content = self._extract_with_trafilatura(response.text, final_url)
             
             if not content or len(content) < 100:
                 content = self._extract_with_beautifulsoup(response.text)
@@ -42,12 +44,12 @@ class ArticleScraper:
             return content
             
         except requests.exceptions.Timeout:
-            print(f"Timeout: {url[:60]}...")
+            print(f"  ⚠ Timeout: {url[:60]}...")
             random_delay()
             return self.scrape_article(url, retries + 1)
             
         except requests.exceptions.RequestException as e:
-            print(f"Request error: {str(e)[:50]}")
+            print(f"  ⚠ Request error: {str(e)[:50]}")
             if retries < config.MAX_RETRIES - 1:
                 random_delay()
                 return self.scrape_article(url, retries + 1)

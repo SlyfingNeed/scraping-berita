@@ -1,4 +1,4 @@
-# Indonesian News Keyword-Based Scraper
+# Indonesian News Scraper
 
 A production-grade Python scraper that collects Indonesian news articles based on specific keywords from multiple sources and exports them to CSV/XLSX.
 
